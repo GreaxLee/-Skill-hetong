@@ -322,14 +322,21 @@ def next_contract_number(factory_cfg: dict, year: int) -> tuple[str, str, int]:
 
 
 def parse_order_plan(path: str, target_date: datetime.date) -> dict:
+    """
+    Returns dict keyed by (factory_name, is_larzonic).
+    Larzonic sheet orders are kept separate from other sheets even for the same factory,
+    because they use factory price (出厂价) while others use tax-inclusive price (含税价).
+    """
     wb = openpyxl.load_workbook(path, data_only=True)
-    all_orders: dict[str, list] = {}
+    all_orders: dict[tuple, list] = {}
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         sheet_orders = _parse_sheet(ws, sheet_name, target_date)
+        is_larzonic = sheet_name == "Larzonic"
         for factory, items in sheet_orders.items():
-            all_orders.setdefault(factory, []).extend(items)
+            key = (factory, is_larzonic)
+            all_orders.setdefault(key, []).extend(items)
 
     return all_orders
 
@@ -493,13 +500,14 @@ def generate_contract(
     sku_detail_lookup: dict,
     sku_image_lookup: dict,
     today: datetime.date,
+    template_override: Optional[str] = None,
 ) -> Optional[str]:
     year = today.year
     contract_number, filename, seq = next_contract_number(factory_cfg, year)
     folder = get_year_folder(factory_cfg["base_folder"], year)
     out_path = os.path.join(folder, filename)
 
-    template_path = get_template_file(factory_cfg, year)
+    template_path = template_override if template_override is not None else get_template_file(factory_cfg, year)
     if template_path is None:
         print(f"  [错误] 找不到 {factory_name} 的合同模板，跳过")
         return None
@@ -548,10 +556,12 @@ def generate_contract(
         print(f"  [跳过] {factory_name}: 没有有效SKU")
         return None
 
+    is_larzonic = any(item.get("larzonic") for item in orders)
+
     shutil.copy2(template_path, out_path)
     wb = openpyxl.load_workbook(out_path)
     _fill_purchase_sheet(wb["采购单"], contract_number, today)
-    _fill_contract_sheet(wb["合同标的"], contract_number, target_date, enriched)
+    _fill_contract_sheet(wb["合同标的"], contract_number, target_date, enriched, is_larzonic=is_larzonic)
     wb.save(out_path)
     _rebuild_contract_drawings(template_path, out_path, enriched, sku_image_lookup)
 
@@ -583,6 +593,7 @@ ROW_HEIGHT_PT = 138  # fixed data-row height — keeps printed images the same s
 
 _THIN = Side(style="thin")
 _FULL_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_NO_BORDER = Border()
 
 # Per-column alignment for data rows (col index 1-based)
 _COL_ALIGN = {
@@ -596,9 +607,16 @@ _COL_ALIGN = {
 }
 
 
-def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, enriched: list):
+def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, enriched: list, is_larzonic: bool = False):
     ws.cell(1, 2).value = contract_number
     ws.cell(2, 2).value = datetime.datetime(target_date.year, target_date.month, target_date.day)
+
+    # Fix price column header: template always says "出厂价"; non-Larzonic contracts use 含税价
+    if not is_larzonic:
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(5, c)
+            if cell.value and "出厂价" in str(cell.value):
+                cell.value = str(cell.value).replace("出厂价", "含税价")
 
     data_area_merges = [mr for mr in list(ws.merged_cells.ranges) if mr.min_row >= 6]
     for mr in data_area_merges:
@@ -634,6 +652,14 @@ def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, e
     ws.cell(total_row, 1).value = "合计"
     ws.cell(total_row, 6).value = f"=SUM(F{data_start_row}:F{last_data_row})"
     ws.cell(total_row, 8).value = f"=SUM(H{data_start_row}:H{last_data_row})"
+
+    # Remove borders and reset row height for all template rows below the total row
+    for r in range(total_row + 1, ws.max_row + 1):
+        ws.row_dimensions[r].height = None
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            if not isinstance(cell, MergedCell):
+                cell.border = _NO_BORDER
 
 
 def _clear_data_rows(ws, start_row: int):
@@ -837,24 +863,35 @@ def main():
         sys.exit(0)
 
     print(f"  找到 {len(orders_by_factory)} 个工厂的订单:")
-    for factory, items in orders_by_factory.items():
-        print(f"    {factory}: {len(items)} 个SKU")
+    for (factory, is_larzonic), items in orders_by_factory.items():
+        tag = "（Larzonic 出厂价）" if is_larzonic else "（含税价）"
+        print(f"    {factory}{tag}: {len(items)} 个SKU")
     print()
 
+    # Snapshot template paths before any contracts are generated, so newly created contracts
+    # don't accidentally become the template for subsequent contracts in the same run.
+    template_snapshot: dict[str, Optional[str]] = {
+        name: get_template_file(cfg, today.year)
+        for name, cfg in factory_configs.items()
+    }
+
     generated = []
-    for factory_name in sorted(orders_by_factory.keys()):
+    for (factory_name, is_larzonic) in sorted(orders_by_factory.keys()):
         if factory_name not in factory_configs:
             print(f"  [警告] 未配置工厂: {factory_name}，请在 config.json 的 factories 里添加，跳过")
             continue
+        tag = "（Larzonic 出厂价）" if is_larzonic else "（含税价）"
+        print(f"\n正在生成 {factory_name}{tag} 合同…")
         result = generate_contract(
             factory_name=factory_name,
             factory_cfg=factory_configs[factory_name],
-            orders=orders_by_factory[factory_name],
+            orders=orders_by_factory[(factory_name, is_larzonic)],
             target_date=target_date,
             price_lookup=price_lookup,
             sku_detail_lookup=sku_detail_lookup,
             sku_image_lookup=sku_image_lookup,
             today=today,
+            template_override=template_snapshot.get(factory_name),
         )
         if result:
             generated.append(result)
