@@ -577,6 +577,9 @@ def _fill_purchase_sheet(ws, contract_number: str, today: datetime.date):
                 )
 
 
+ROW_HEIGHT_PT = 138  # fixed data-row height — keeps printed images the same size every time
+
+
 def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, enriched: list):
     ws.cell(1, 2).value = contract_number
     ws.cell(2, 2).value = datetime.datetime(target_date.year, target_date.month, target_date.day)
@@ -590,6 +593,7 @@ def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, e
     data_start_row = 6
     for i, item in enumerate(enriched):
         r = data_start_row + i
+        ws.row_dimensions[r].height = ROW_HEIGHT_PT
         ws.cell(r, 1).value = item["sku"]
         ws.cell(r, 2).value = item["product_name"]
         ws.cell(r, 4).value = item["param"]
@@ -651,8 +655,12 @@ def _rebuild_contract_drawings(
         sku_to_rid[sku] = seen_hashes[h]
 
     # Build new drawing1.xml
-    COL, COL_OFF_FROM, COL_OFF_TO = 2, 50000, 1050000
-    ROW_OFF_FROM, ROW_OFF_TO = 100000, 1400000
+    # Col offsets from existing contracts (col C ≈ 30mm wide)
+    # Row offsets derived from ROW_HEIGHT_PT so images are always the same printed size
+    COL, COL_OFF_FROM, COL_OFF_TO = 2, 34290, 1129030
+    _row_padding = 95000  # ~2.6mm top/bottom padding
+    ROW_OFF_FROM = _row_padding
+    ROW_OFF_TO = ROW_HEIGHT_PT * 12700 - _row_padding  # 1657600 EMU for 138pt rows
 
     anchor_parts = []
     for pic_id, (i, sku) in enumerate(skus_with_images, start=2):
