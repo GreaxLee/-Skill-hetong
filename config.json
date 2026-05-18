@@ -1,0 +1,51 @@
+{
+  "order_plan_file": "/Users/shawlee/Desktop/订货计划共享表.xlsx",
+  "price_list_file": "/Users/shawlee/Desktop/产品价格表.xlsx",
+  "factories": {
+    "惠州市丽瑞家居有限公司": {
+      "contract_prefix": "01HZLR",
+      "base_folder": "/Users/shawlee/好消息/工厂/惠州丽瑞/合同",
+      "file_prefix": "丽瑞合同",
+      "seller_name": "惠州市丽瑞家居有限公司",
+      "seller_contact": "刘小琼",
+      "seller_phone": "13725559521",
+      "bank_name": "招商银行惠州惠阳支行",
+      "bank_account": "752901874210268",
+      "bank_holder": "惠州市丽瑞家居有限公司",
+      "payment_terms": "货款月结，次月25号",
+      "buyer_contact": "王语嫣",
+      "buyer_phone": "15720616686",
+      "price_col": "含税价"
+    },
+    "东莞市永铭五金制品有限公司": {
+      "contract_prefix": "01DGYM",
+      "base_folder": "/Users/shawlee/好消息/工厂/东莞永铭/合同",
+      "file_prefix": "永铭合同",
+      "seller_name": "东莞市永铭五金制品有限公司",
+      "seller_contact": "林建民",
+      "seller_phone": "13902311630",
+      "bank_name": "中国银行东莞清溪支行",
+      "bank_account": "719857882643",
+      "bank_holder": "东莞市永铭五金制品有限公司",
+      "payment_terms": "货款月结，次月20号",
+      "buyer_contact": "王语嫣",
+      "buyer_phone": "15720616686",
+      "price_col": "含税价"
+    },
+    "青岛翊霖源工艺品有限公司": {
+      "contract_prefix": "01QYLY",
+      "base_folder": "/Users/shawlee/好消息/工厂/青岛翊霖/合同",
+      "file_prefix": "翊霖源合同",
+      "seller_name": "青岛翊霖源工艺品有限公司",
+      "seller_contact": "王洪志",
+      "seller_phone": "15898873161",
+      "bank_name": "青岛银行",
+      "bank_account": "6232120100006539858",
+      "bank_holder": "王守军",
+      "payment_terms": "出货后30天内支付剩余货款",
+      "buyer_contact": "郭重阳",
+      "buyer_phone": "17203878583",
+      "price_col": "含税价"
+    }
+  }
+}
