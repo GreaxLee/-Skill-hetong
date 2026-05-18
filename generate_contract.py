@@ -156,8 +156,86 @@ def _expand_sku_variants(sku_raw: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# SKU detail lookup (scan existing contracts)
+# SKU detail + image lookup (scan existing contracts)
 # ---------------------------------------------------------------------------
+
+
+def build_sku_image_lookup(scan_dirs: list[str]) -> dict:
+    """
+    Scan all contracts for product images.
+    Returns dict: sku -> image bytes (PNG or JPEG)
+    Uses the anchor row in drawing1.xml to map image → SKU.
+    """
+    lookup: dict[str, bytes] = {}
+
+    for scan_dir in scan_dirs:
+        if not os.path.isdir(scan_dir):
+            continue
+        for root, _dirs, files in os.walk(scan_dir):
+            for fname in files:
+                if not fname.endswith(".xlsx") or fname.startswith("~"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    _extract_images_from_contract(fpath, lookup)
+                except Exception:
+                    pass
+
+    return lookup
+
+
+def _extract_images_from_contract(path: str, lookup: dict):
+    """Extract SKU→image mapping from a single contract file."""
+    with zipfile.ZipFile(path, "r") as z:
+        names = z.namelist()
+        drawing_path = "xl/drawings/drawing1.xml"
+        rels_path = "xl/drawings/_rels/drawing1.xml.rels"
+        if drawing_path not in names or rels_path not in names:
+            return
+
+        # rId → image file path
+        rels_xml = z.read(rels_path).decode("utf-8")
+        rid_to_img: dict[str, str] = {}
+        for m in re.finditer(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rels_xml):
+            target = m.group(2).replace("../", "xl/")
+            rid_to_img[m.group(1)] = target
+
+        # anchor row (0-indexed) → rId
+        drawing_xml = z.read(drawing_path).decode("utf-8")
+        anchors = re.findall(r"<xdr:twoCellAnchor.*?</xdr:twoCellAnchor>", drawing_xml, re.DOTALL)
+        row_to_rid: dict[int, str] = {}
+        for anchor in anchors:
+            row_m = re.search(r"<xdr:from>.*?<xdr:row>(\d+)</xdr:row>", anchor, re.DOTALL)
+            rid_m = re.search(r'r:embed="(rId\d+)"', anchor)
+            if row_m and rid_m:
+                row_to_rid[int(row_m.group(1))] = rid_m.group(1)
+
+    # Read SKUs from the sheet (need a separate open outside the zip context)
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+    except Exception:
+        return
+    if "合同标的" not in wb.sheetnames:
+        return
+    ws = wb["合同标的"]
+    sku_by_xl_row: dict[int, str] = {}
+    for i, row in enumerate(ws.iter_rows(min_row=6, values_only=True)):
+        sku = row[0]
+        if not sku:
+            continue
+        sku = str(sku).strip()
+        if sku and sku[0].isalnum():
+            sku_by_xl_row[6 + i] = sku  # Excel row (1-indexed)
+
+    # Map SKU → image bytes (drawing rows are 0-indexed, so +1 = Excel row)
+    with zipfile.ZipFile(path, "r") as z:
+        for draw_row, rid in row_to_rid.items():
+            xl_row = draw_row + 1
+            sku = sku_by_xl_row.get(xl_row)
+            if sku and sku not in lookup:
+                img_path = rid_to_img.get(rid, "")
+                if img_path in z.namelist():
+                    lookup[sku] = z.read(img_path)
 
 
 def build_sku_detail_lookup(scan_dirs: list[str]) -> dict:
@@ -412,6 +490,7 @@ def generate_contract(
     target_date: datetime.date,
     price_lookup: dict,
     sku_detail_lookup: dict,
+    sku_image_lookup: dict,
     today: datetime.date,
 ) -> Optional[str]:
     year = today.year
@@ -473,7 +552,7 @@ def generate_contract(
     _fill_purchase_sheet(wb["采购单"], contract_number, today)
     _fill_contract_sheet(wb["合同标的"], contract_number, target_date, enriched)
     wb.save(out_path)
-    _copy_drawings_from_template(template_path, out_path)
+    _rebuild_contract_drawings(template_path, out_path, enriched, sku_image_lookup)
 
     total_qty = sum(item["qty"] for item in enriched)
     total_amount = sum(item["qty"] * item["price"] for item in enriched)
@@ -534,32 +613,120 @@ def _clear_data_rows(ws, start_row: int):
                 cell.value = None
 
 
-def _copy_drawings_from_template(template_path: str, out_path: str):
-    DRAWING_PREFIXES = ("xl/drawings/", "xl/media/")
+def _rebuild_contract_drawings(
+    template_path: str,
+    out_path: str,
+    enriched: list,
+    sku_image_lookup: dict,
+):
+    """
+    Rebuild the contract zip with correct product images in 合同标的 (drawing1.xml).
+    Structural drawings on other sheets (logos, signatures) are copied from the template.
+    """
+    DATA_START_ROW = 6  # first data row in 合同标的 (1-indexed Excel)
 
+    # Build content-hash → (rId, media_path, bytes) for deduplication
+    seen_hashes: dict[int, str] = {}   # content hash → rId
+    rid_to_path: dict[str, str] = {}   # rId → xl/media/... path
+    new_media: dict[str, bytes] = {}   # xl/media/... → bytes
+    sku_to_rid: dict[str, str] = {}    # sku → rId
+
+    rid_counter = 1
+    skus_with_images = [
+        (i, item["sku"]) for i, item in enumerate(enriched)
+        if item["sku"] in sku_image_lookup
+    ]
+
+    for _, sku in skus_with_images:
+        img_bytes = sku_image_lookup[sku]
+        h = hash(img_bytes)
+        if h not in seen_hashes:
+            rid = f"rId{rid_counter}"
+            ext = "jpeg" if img_bytes[:3] == b"\xff\xd8\xff" else "png"
+            media_path = f"xl/media/prod_image{rid_counter}.{ext}"
+            seen_hashes[h] = rid
+            rid_to_path[rid] = media_path
+            new_media[media_path] = img_bytes
+            rid_counter += 1
+        sku_to_rid[sku] = seen_hashes[h]
+
+    # Build new drawing1.xml
+    COL, COL_OFF_FROM, COL_OFF_TO = 2, 50000, 1050000
+    ROW_OFF_FROM, ROW_OFF_TO = 100000, 1400000
+
+    anchor_parts = []
+    for pic_id, (i, sku) in enumerate(skus_with_images, start=2):
+        draw_row = DATA_START_ROW + i - 1   # 0-indexed drawing row
+        rid = sku_to_rid[sku]
+        anchor_parts.append(
+            f'<xdr:twoCellAnchor editAs="oneCell">'
+            f"<xdr:from><xdr:col>{COL}</xdr:col><xdr:colOff>{COL_OFF_FROM}</xdr:colOff>"
+            f"<xdr:row>{draw_row}</xdr:row><xdr:rowOff>{ROW_OFF_FROM}</xdr:rowOff></xdr:from>"
+            f"<xdr:to><xdr:col>{COL}</xdr:col><xdr:colOff>{COL_OFF_TO}</xdr:colOff>"
+            f"<xdr:row>{draw_row}</xdr:row><xdr:rowOff>{ROW_OFF_TO}</xdr:rowOff></xdr:to>"
+            f'<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{pic_id}" name="产品图{pic_id}"/>'
+            f'<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>'
+            f'<xdr:blipFill><a:blip r:embed="{rid}"/>'
+            f"<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>"
+            f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="962025" cy="1270000"/></a:xfrm>'
+            f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+            f"<a:noFill/><a:ln w=\"9525\"><a:noFill/></a:ln></xdr:spPr></xdr:pic>"
+            f"<xdr:clientData/></xdr:twoCellAnchor>"
+        )
+
+    new_drawing_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+        + "".join(anchor_parts)
+        + "</xdr:wsDr>"
+    ).encode("utf-8")
+
+    new_drawing_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="{rid}" '
+            f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            f'Target="{path.replace("xl/", "../")}"/>'
+            for rid, path in rid_to_path.items()
+        )
+        + "</Relationships>"
+    ).encode("utf-8")
+
+    # Read structural pieces from template (non-product drawings and rels)
     with zipfile.ZipFile(template_path, "r") as tmpl_zip:
-        drawing_names = [n for n in tmpl_zip.namelist()
-                         if any(n.startswith(p) for p in DRAWING_PREFIXES)]
-        if not drawing_names:
-            return
-        drawing_data = {name: tmpl_zip.read(name) for name in drawing_names}
+        tmpl_structural: dict[str, bytes] = {}
+        for name in tmpl_zip.namelist():
+            if name.startswith("xl/drawings/") and name != "xl/drawings/drawing1.xml" \
+                    and name != "xl/drawings/_rels/drawing1.xml.rels":
+                tmpl_structural[name] = tmpl_zip.read(name)
 
         sheet_drawing_ref: dict[str, str] = {}
         for name in tmpl_zip.namelist():
             if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
                 content = tmpl_zip.read(name).decode("utf-8")
-                m = re.search(r'<drawing[^/]*/>', content)
+                m = re.search(r"<drawing[^/]*/>", content)
                 if m:
                     sheet_drawing_ref[os.path.basename(name)] = m.group(0)
 
-        sheet_rels = {name: tmpl_zip.read(name) for name in tmpl_zip.namelist()
-                      if name.startswith("xl/worksheets/_rels/")}
+        sheet_rels = {
+            name: tmpl_zip.read(name)
+            for name in tmpl_zip.namelist()
+            if name.startswith("xl/worksheets/_rels/")
+        }
 
+    # Rewrite the output zip
     tmp_path = out_path + ".tmp"
+    skip = (
+        set(tmpl_structural) | set(sheet_rels) | set(new_media)
+        | {"xl/drawings/drawing1.xml", "xl/drawings/_rels/drawing1.xml.rels"}
+    )
+
     with zipfile.ZipFile(out_path, "r") as out_zip, \
          zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as new_zip:
 
-        skip = set(drawing_data) | set(sheet_rels)
         for item in out_zip.infolist():
             if item.filename in skip:
                 continue
@@ -568,18 +735,23 @@ def _copy_drawings_from_template(template_path: str, out_path: str):
             if fname in sheet_drawing_ref and item.filename.startswith("xl/worksheets/"):
                 text = content.decode("utf-8")
                 if "<drawing" not in text:
-                    drawing_tag = sheet_drawing_ref[fname]
+                    tag = sheet_drawing_ref[fname]
                     r_ns = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
                     if r_ns not in text:
                         text = text.replace("<worksheet ", f"<worksheet {r_ns} ", 1)
-                    text = text.replace("</worksheet>", f"{drawing_tag}</worksheet>")
+                    text = text.replace("</worksheet>", f"{tag}</worksheet>")
                     content = text.encode("utf-8")
             new_zip.writestr(item, content)
 
-        for name, data in drawing_data.items():
+        for name, data in tmpl_structural.items():
             new_zip.writestr(name, data)
         for name, data in sheet_rels.items():
             new_zip.writestr(name, data)
+        for name, data in new_media.items():
+            new_zip.writestr(name, data)
+
+        new_zip.writestr("xl/drawings/drawing1.xml", new_drawing_xml)
+        new_zip.writestr("xl/drawings/_rels/drawing1.xml.rels", new_drawing_rels)
 
     os.replace(tmp_path, out_path)
 
@@ -618,9 +790,10 @@ def main():
     price_lookup = load_price_list(price_list_file)
     print(f"  加载了 {len(price_lookup)} 个SKU的价格")
 
-    print("正在扫描合同文件以建立SKU详情库…")
+    print("正在扫描合同文件以建立SKU详情库和图片库…")
     sku_detail_lookup = build_sku_detail_lookup(scan_dirs)
-    print(f"  扫描到 {len(sku_detail_lookup)} 个SKU的详情")
+    sku_image_lookup = build_sku_image_lookup(scan_dirs)
+    print(f"  扫描到 {len(sku_detail_lookup)} 个SKU的详情，{len(sku_image_lookup)} 个SKU的图片")
 
     print("正在解析订货计划…")
     orders_by_factory = parse_order_plan(order_plan_file, target_date)
@@ -646,6 +819,7 @@ def main():
             target_date=target_date,
             price_lookup=price_lookup,
             sku_detail_lookup=sku_detail_lookup,
+            sku_image_lookup=sku_image_lookup,
             today=today,
         )
         if result:
