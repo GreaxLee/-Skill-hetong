@@ -21,7 +21,8 @@ from copy import copy
 from typing import Optional
 
 import openpyxl
-from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Border, Side, Alignment
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -580,6 +581,21 @@ def _fill_purchase_sheet(ws, contract_number: str, today: datetime.date):
 ROW_HEIGHT_PT = 138  # fixed data-row height — keeps printed images the same size every time
 
 
+_THIN = Side(style="thin")
+_FULL_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+# Per-column alignment for data rows (col index 1-based)
+_COL_ALIGN = {
+    1: Alignment(wrap_text=True, vertical="center", horizontal="center"),
+    2: Alignment(wrap_text=True, vertical="center", horizontal="center"),
+    3: Alignment(wrap_text=False, vertical="center", horizontal="center"),
+    4: Alignment(wrap_text=True, vertical="top",    horizontal="left"),
+    6: Alignment(wrap_text=True, vertical="center", horizontal="center"),
+    7: Alignment(wrap_text=True, vertical="center", horizontal="center"),
+    8: Alignment(wrap_text=True, vertical="center", horizontal="center"),
+}
+
+
 def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, enriched: list):
     ws.cell(1, 2).value = contract_number
     ws.cell(2, 2).value = datetime.datetime(target_date.year, target_date.month, target_date.day)
@@ -587,6 +603,9 @@ def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, e
     data_area_merges = [mr for mr in list(ws.merged_cells.ranges) if mr.min_row >= 6]
     for mr in data_area_merges:
         ws.unmerge_cells(str(mr))
+
+    # Capture font from template row 6 (宋体 11pt) for reuse
+    tmpl_font = copy(ws.cell(6, 1).font)
 
     _clear_data_rows(ws, start_row=6)
 
@@ -602,6 +621,14 @@ def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, e
         ws.cell(r, 7).value = item["price"]
         ws.cell(r, 8).value = f"=F{r}*G{r}"
 
+        for c in range(1, 9):
+            cell = ws.cell(r, c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.font = copy(tmpl_font)
+            cell.alignment = copy(_COL_ALIGN.get(c, _COL_ALIGN[1]))
+            cell.border = _FULL_BORDER
+
     last_data_row = data_start_row + len(enriched) - 1
     total_row = last_data_row + 1
     ws.cell(total_row, 1).value = "合计"
@@ -610,7 +637,6 @@ def _fill_contract_sheet(ws, contract_number: str, target_date: datetime.date, e
 
 
 def _clear_data_rows(ws, start_row: int):
-    from openpyxl.cell.cell import MergedCell
     for row in ws.iter_rows(min_row=start_row):
         for cell in row:
             if not isinstance(cell, MergedCell):
