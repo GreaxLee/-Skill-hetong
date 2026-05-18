@@ -1,0 +1,11 @@
+# Excel files (local data, not part of the skill)
+*.xlsx
+*.xls
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
